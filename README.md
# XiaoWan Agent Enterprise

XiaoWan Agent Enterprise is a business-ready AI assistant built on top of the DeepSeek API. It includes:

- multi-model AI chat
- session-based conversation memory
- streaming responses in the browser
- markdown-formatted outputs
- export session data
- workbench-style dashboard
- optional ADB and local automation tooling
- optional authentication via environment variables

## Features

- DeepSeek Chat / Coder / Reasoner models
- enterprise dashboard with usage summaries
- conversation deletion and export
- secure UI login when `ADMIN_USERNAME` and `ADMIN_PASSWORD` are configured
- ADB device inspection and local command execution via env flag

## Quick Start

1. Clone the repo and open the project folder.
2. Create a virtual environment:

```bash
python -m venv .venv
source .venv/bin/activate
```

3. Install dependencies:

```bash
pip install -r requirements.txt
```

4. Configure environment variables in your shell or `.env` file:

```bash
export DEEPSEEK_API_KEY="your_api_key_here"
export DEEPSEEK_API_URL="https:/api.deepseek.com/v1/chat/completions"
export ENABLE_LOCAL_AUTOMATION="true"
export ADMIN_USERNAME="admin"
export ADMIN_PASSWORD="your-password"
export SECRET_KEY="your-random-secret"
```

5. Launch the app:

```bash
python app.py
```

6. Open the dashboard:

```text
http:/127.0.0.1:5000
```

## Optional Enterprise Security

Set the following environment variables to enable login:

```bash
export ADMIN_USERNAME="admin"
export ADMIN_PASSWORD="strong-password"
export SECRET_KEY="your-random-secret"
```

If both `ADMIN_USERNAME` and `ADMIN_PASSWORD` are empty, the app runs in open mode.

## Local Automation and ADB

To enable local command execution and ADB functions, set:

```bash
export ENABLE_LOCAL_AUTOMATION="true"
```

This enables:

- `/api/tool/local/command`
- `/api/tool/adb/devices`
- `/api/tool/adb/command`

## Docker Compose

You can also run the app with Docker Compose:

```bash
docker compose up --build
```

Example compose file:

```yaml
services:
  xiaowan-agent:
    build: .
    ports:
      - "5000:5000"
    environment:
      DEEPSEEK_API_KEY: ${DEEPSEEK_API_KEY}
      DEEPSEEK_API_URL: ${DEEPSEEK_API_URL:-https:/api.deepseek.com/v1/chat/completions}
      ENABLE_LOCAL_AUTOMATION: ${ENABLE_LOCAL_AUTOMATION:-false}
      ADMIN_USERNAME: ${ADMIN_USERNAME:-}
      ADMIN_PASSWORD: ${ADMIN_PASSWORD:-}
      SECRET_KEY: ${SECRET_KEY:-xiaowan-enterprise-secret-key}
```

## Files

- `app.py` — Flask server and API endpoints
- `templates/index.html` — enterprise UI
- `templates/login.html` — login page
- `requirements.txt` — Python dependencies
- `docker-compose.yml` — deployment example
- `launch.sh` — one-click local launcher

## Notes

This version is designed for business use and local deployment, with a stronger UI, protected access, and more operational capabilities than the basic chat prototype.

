@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XiaoWan Agent Login</title>
+    <style>
+        :root {
+            --bg: #07111f;
+            --panel: rgba(13, 28, 47, 0.9);
+            --input: #0b1422;
+            --border: rgba(148, 163, 184, 0.18);
+            --text: #edf6ff;
+            --muted: #9ca9be;
+            --primary: #4f8cff;
+            --danger: #f87171;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            min-height: 100%;
+            background: linear-gradient(135deg, #07111f 0%, #0d1c2f 40%, #0b1020 100%);
+            color: var(--text);
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        }
+        body {
+            display: grid;
+            place-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .card {
+            width: min(420px, 100%);
+            padding: 32px 26px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 28px 80px rgba(2, 6, 23, 0.45);
+        }
+        h1 {
+            margin-top: 0;
+            margin-bottom: 8px;
+            font-size: 2rem;
+        }
+        .subtitle {
+            color: var(--muted);
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            color: var(--muted);
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }
+        input {
+            width: 100%;
+            margin-bottom: 14px;
+            padding: 12px 14px;
+            background: var(--input);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text);
+            outline: none;
+        }
+        input:focus {
+            border-color: rgba(79, 140, 255, 0.9);
+            box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.12);
+        }
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 12px;
+            padding: 12px 16px;
+            background: linear-gradient(135deg, var(--primary), #2d6df6);
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .error {
+            color: #ffdada;
+            background: rgba(248,113,113,0.08);
+            border: 1px solid rgba(248,113,113,0.3);
+            padding: 10px 12px;
+            border-radius: 10px;
+            margin-bottom: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>XiaoWan Agent</h1>
+        <div class="subtitle">Enterprise Access Login</div>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="post">
+            <label for="username">Username</label>
+            <input id="username" name="username" type="text" required />
+
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" required />
+
+            <button type="submit">登录</button>
+        </form>
+    </div>
+</body>
+</html>
+
