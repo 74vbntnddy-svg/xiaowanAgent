@@ -1,0 +1,85 @@
+# XiaoWan Agent
+
+XiaoWan Agent is a lightweight local web AI assistant powered by the DeepSeek API. It supports multi-model selection, session history, streaming responses, local automation controls, and optional Android ADB tools.
+
+## Features
+- DeepSeek model selector with multi-model support
+- Session-based chat memory
+- Streaming responses in the web UI
+- Local automation command execution (opt-in)
+- Android ADB device checking via tool endpoint
+- Clean browser-based interface
+- Environment variable support
+
+## Quick Start
+
+1. Create and activate a virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Configure environment variables
+
+```bash
+export DEEPSEEK_API_KEY="your_api_key_here"
+export DEEPSEEK_API_URL="https://api.deepseek.com/v1/chat/completions"
+export ENABLE_LOCAL_AUTOMATION="true"
+```
+
+4. Run the app
+
+```bash
+python app.py
+```
+
+5. Open the app in your browser
+
+```text
+http://127.0.0.1:5000
+```
+
+## Project Structure
+
+```text
+.
+├── app.py
+├── README.md
+├── requirements.txt
+├── data/
+│   └── chat_history.json
+├── templates/
+│   └── index.html
+└── .env.example
+```
+
+## Environment Variables
+
+```bash
+DEEPSEEK_API_KEY=your_api_key_here
+DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
+ENABLE_LOCAL_AUTOMATION=false
+```
+
+## Security Notes
+
+- Local automation and ADB commands are disabled by default.
+- Set `ENABLE_LOCAL_AUTOMATION=true` only if you explicitly want local command execution.
+- Keep your API key in a secure environment or local secret store.
+
+## Notes
+
+This project is intentionally simple, local-first, and easy to extend. Potential next upgrades include:
+- persistent database storage
+- markdown rendering in the chat UI
+- richer ADB device control and screenshots
+- stronger session management and export/import
+- deployment configuration for Docker or cloud hosting
+

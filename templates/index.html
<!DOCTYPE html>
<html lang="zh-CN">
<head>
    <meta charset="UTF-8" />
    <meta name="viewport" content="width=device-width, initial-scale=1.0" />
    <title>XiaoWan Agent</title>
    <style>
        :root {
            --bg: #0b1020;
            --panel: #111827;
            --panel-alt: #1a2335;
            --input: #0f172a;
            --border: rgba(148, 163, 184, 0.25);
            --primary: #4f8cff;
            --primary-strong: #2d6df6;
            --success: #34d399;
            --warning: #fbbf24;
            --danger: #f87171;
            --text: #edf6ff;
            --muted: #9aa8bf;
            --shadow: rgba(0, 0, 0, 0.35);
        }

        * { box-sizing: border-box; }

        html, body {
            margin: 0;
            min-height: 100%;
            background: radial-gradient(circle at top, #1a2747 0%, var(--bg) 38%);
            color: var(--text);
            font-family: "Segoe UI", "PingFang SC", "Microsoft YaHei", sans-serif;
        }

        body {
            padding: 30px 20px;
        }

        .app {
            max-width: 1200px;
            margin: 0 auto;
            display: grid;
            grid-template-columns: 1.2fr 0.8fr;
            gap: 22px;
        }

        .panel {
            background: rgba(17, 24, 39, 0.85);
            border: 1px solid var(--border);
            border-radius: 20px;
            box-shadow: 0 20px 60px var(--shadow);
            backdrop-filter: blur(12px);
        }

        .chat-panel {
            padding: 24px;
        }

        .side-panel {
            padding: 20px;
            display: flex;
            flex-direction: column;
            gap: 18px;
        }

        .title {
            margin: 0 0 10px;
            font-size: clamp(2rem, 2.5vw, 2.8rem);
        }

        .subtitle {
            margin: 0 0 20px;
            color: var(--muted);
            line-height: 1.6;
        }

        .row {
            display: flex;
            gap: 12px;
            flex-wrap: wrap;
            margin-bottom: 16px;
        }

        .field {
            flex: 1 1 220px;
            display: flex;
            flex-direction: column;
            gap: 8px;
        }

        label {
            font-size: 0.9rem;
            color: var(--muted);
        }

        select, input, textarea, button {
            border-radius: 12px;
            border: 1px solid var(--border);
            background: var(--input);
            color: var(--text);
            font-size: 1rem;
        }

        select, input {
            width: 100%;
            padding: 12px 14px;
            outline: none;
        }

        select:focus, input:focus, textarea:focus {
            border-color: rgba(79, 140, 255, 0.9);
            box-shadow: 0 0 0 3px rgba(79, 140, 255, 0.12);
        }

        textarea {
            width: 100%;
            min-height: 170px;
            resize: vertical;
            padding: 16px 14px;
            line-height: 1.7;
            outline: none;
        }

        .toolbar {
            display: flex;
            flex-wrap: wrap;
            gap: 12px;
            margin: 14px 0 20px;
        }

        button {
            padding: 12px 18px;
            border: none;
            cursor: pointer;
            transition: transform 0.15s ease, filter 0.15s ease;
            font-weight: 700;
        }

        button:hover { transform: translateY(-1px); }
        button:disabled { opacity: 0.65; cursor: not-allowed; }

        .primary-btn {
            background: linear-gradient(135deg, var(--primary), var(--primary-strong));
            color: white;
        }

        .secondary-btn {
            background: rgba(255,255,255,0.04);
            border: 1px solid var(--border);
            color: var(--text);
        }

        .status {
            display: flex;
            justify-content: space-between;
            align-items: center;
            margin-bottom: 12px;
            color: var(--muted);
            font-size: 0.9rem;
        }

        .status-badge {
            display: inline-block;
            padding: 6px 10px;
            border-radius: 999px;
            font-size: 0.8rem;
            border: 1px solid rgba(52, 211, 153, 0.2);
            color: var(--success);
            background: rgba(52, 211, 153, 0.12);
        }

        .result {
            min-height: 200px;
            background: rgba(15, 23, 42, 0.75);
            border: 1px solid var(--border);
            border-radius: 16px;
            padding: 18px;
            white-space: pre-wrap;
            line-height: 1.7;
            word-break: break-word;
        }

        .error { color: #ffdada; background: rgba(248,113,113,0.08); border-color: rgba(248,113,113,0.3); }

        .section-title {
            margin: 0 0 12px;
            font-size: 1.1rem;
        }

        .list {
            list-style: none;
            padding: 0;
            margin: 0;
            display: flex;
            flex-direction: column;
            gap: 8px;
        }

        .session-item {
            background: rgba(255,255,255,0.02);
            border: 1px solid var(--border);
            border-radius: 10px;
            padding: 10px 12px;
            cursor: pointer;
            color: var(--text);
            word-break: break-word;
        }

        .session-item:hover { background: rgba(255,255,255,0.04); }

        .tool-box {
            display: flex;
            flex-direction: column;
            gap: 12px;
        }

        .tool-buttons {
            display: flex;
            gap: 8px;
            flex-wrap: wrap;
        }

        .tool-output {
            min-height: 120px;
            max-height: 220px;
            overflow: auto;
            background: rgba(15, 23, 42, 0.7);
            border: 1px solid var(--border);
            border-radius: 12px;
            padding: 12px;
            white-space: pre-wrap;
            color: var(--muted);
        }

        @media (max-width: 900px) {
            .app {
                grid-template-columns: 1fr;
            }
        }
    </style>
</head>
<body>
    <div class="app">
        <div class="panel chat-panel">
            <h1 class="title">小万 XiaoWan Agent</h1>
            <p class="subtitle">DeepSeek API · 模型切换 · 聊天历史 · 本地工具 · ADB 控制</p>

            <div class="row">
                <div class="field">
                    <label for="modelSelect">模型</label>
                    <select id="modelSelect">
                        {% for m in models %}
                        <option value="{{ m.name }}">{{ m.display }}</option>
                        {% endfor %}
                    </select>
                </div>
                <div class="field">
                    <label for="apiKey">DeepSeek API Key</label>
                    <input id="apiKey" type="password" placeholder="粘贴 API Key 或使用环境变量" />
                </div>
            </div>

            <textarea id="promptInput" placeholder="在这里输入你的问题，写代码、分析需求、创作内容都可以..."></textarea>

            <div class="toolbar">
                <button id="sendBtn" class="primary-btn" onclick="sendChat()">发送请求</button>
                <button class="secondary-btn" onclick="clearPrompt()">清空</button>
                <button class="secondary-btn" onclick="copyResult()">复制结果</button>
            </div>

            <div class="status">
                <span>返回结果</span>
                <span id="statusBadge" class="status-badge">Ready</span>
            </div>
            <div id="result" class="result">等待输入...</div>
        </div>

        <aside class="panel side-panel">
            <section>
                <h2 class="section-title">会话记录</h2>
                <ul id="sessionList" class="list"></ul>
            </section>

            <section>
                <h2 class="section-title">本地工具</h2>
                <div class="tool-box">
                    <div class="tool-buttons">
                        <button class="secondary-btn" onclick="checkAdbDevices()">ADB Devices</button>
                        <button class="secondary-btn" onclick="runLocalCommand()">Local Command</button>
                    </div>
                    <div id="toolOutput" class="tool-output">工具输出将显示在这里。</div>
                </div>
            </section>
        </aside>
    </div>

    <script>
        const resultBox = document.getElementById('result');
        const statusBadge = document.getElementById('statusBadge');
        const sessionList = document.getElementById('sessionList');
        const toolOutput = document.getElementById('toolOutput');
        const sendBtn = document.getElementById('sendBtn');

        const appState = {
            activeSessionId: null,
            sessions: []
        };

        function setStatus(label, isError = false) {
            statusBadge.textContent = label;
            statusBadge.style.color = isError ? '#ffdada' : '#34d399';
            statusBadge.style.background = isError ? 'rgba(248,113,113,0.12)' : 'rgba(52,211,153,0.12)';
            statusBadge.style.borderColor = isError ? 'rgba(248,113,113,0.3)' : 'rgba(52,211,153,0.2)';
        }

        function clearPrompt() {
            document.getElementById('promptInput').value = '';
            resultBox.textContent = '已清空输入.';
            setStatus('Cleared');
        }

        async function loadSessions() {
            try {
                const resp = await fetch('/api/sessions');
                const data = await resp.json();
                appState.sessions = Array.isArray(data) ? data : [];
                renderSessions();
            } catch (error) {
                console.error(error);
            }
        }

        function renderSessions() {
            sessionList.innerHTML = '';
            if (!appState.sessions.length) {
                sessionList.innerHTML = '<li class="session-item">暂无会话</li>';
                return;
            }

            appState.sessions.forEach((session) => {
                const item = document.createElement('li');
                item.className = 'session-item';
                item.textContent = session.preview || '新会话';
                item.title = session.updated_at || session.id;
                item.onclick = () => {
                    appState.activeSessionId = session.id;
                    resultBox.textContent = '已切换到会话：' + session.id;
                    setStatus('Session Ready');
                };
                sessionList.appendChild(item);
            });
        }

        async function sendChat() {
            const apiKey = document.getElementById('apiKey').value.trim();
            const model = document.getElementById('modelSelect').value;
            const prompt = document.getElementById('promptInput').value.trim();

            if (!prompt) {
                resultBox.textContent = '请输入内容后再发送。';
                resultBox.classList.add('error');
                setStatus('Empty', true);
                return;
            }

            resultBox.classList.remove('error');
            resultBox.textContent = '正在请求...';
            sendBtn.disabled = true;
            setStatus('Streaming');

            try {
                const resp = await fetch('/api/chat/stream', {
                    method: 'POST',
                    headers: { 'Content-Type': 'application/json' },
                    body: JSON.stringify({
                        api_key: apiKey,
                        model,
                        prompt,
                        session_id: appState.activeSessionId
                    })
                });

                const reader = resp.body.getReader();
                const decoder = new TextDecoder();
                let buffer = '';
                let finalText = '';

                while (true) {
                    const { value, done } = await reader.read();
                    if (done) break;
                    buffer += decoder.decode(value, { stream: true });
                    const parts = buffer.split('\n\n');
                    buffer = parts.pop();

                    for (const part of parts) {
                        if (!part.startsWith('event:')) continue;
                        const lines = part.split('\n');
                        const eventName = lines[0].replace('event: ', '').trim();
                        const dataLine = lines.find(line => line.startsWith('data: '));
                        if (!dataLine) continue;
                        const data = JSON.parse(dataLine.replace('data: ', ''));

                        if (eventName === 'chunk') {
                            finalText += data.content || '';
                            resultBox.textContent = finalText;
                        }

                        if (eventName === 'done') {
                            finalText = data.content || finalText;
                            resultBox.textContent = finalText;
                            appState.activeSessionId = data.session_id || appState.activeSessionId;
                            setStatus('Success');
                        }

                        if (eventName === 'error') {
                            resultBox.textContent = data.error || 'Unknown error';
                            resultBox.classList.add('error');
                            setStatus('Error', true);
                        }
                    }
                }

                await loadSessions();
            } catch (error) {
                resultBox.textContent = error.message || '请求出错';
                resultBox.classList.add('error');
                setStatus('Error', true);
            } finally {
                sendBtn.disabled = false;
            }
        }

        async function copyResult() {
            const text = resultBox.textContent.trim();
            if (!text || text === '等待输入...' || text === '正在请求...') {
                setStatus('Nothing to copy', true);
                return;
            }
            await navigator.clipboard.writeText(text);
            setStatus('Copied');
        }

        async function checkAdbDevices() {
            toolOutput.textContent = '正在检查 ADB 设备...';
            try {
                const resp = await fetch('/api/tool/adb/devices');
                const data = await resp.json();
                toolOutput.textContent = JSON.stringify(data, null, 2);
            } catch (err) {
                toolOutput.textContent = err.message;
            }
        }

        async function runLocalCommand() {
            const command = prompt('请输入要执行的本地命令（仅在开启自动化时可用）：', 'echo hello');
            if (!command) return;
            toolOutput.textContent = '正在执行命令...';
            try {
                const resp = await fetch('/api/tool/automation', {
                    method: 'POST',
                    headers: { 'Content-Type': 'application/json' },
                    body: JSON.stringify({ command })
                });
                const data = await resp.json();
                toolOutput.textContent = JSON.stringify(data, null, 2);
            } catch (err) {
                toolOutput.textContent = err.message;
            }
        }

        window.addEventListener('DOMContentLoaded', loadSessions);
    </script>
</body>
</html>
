@@ -1,0 +1,309 @@
+import json
+import os
+import shlex
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+import requests
+
+app = Flask(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+HISTORY_FILE = DATA_DIR / "chat_history.json"
+DATA_DIR.mkdir(exist_ok=True)
+
+MODEL_LIST = [
+    {"name": "deepseek-chat", "display": "DeepSeek Chat 通用对话"},
+    {"name": "deepseek-coder", "display": "DeepSeek Coder 代码模式"},
+    {"name": "deepseek-reasoner", "display": "DeepSeek Reasoner 推理模式"},
+]
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are XiaoWan Agent, a helpful local AI assistant. "
+    "Answer clearly, be concise but useful, and provide step-by-step guidance when needed."
+)
+
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return {}
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_history(history):
+    with HISTORY_FILE.open("w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+SESSION_STORE = load_history()
+
+
+def ensure_session(session_id: str | None):
+    if not session_id:
+        session_id = f"session-{int(time.time() * 1000)}"
+
+    session = SESSION_STORE.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "messages": [],
+        },
+    )
+    session["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return session_id
+
+
+def append_message(session_id: str, role: str, content: str):
+    session = SESSION_STORE.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "messages": [],
+        },
+    )
+    session["messages"].append({"role": role, "content": content, "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z"})
+    session["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    save_history(SESSION_STORE)
+
+
+def build_messages(session_id: str | None, prompt: str):
+    session_id = ensure_session(session_id)
+    session = SESSION_STORE.get(session_id, {})
+    messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+    for msg in session.get("messages", []):
+        if msg.get("role") in {"user", "assistant"}:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": prompt})
+    return session_id, messages
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", models=MODEL_LIST)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "models": len(MODEL_LIST)}), 200
+
+
+@app.route("/api/sessions")
+def api_sessions():
+    items = []
+    for session_id, session in sorted(SESSION_STORE.items(), key=lambda item: item[1].get("updated_at", ""), reverse=True):
+        messages = session.get("messages", [])
+        last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+        items.append({
+            "id": session_id,
+            "updated_at": session.get("updated_at"),
+            "preview": last_user[:80],
+        })
+    return jsonify(items)
+
+
+@app.route("/api/session/<session_id>")
+def api_session(session_id):
+    session = SESSION_STORE.get(session_id, {})
+    return jsonify({"id": session_id, "messages": session.get("messages", [])})
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_api():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return jsonify({"error": "DeepSeek API Key is required."}), 400
+    if not prompt:
+        return jsonify({"error": "Prompt cannot be empty."}), 400
+
+    allowed_models = {item["name"] for item in MODEL_LIST}
+    if model_name not in allowed_models:
+        return jsonify({"error": f"Unsupported model: {model_name}"}), 400
+
+    session_id, messages = build_messages(session_id, prompt)
+    append_message(session_id, "user", prompt)
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.7,
+        "stream": False,
+    }
+
+    try:
+        response = requests.post(
+            os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        result = response.json()
+        if response.status_code >= 400:
+            message = result.get("error", {}).get("message") or result.get("message") or "API request failed"
+            return jsonify({"error": message}), response.status_code
+
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        append_message(session_id, "assistant", answer)
+        return jsonify({"session_id": session_id, "content": answer, "raw": result})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Network error: {exc}"}), 500
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return Response("event: error\ndata: {\"error\": \"DeepSeek API Key is required.\"}\n\n", mimetype="text/event-stream")
+    if not prompt:
+        return Response("event: error\ndata: {\"error\": \"Prompt cannot be empty.\"}\n\n", mimetype="text/event-stream")
+
+    session_id, messages = build_messages(session_id, prompt)
+    append_message(session_id, "user", prompt)
+
+    def generate():
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True,
+        }
+
+        try:
+            response = requests.post(
+                os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+                headers=headers,
+                json=body,
+                timeout=60,
+                stream=True,
+            )
+            if response.status_code >= 400:
+                error_data = response.json() if response.content else {}
+                msg = error_data.get("error", {}).get("message") or error_data.get("message") or "API request failed"
+                yield f"event: error\ndata: {json.dumps({'error': msg})}\n\n"
+                return
+
+            collected_chunks = []
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                if raw_line.startswith("data: "):
+                    data = raw_line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event_data = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = event_data.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content") or ""
+                    if not content:
+                        continue
+                    collected_chunks.append(content)
+                    yield f"event: chunk\ndata: {json.dumps({'content': content})}\n\n"
+
+            full_text = "".join(collected_chunks).strip()
+            if full_text:
+                append_message(session_id, "assistant", full_text)
+            yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'content': full_text})}\n\n"
+        except requests.RequestException as exc:
+            yield f"event: error\ndata: {json.dumps({'error': f'Network error: {exc}'})}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+@app.route("/api/tool/adb/devices", methods=["GET"]) 
+def adb_devices():
+    adb_path = shutil_which("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+    result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=20)
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+@app.route("/api/tool/adb/command", methods=["POST"]) 
+def adb_command():
+    data = request.get_json(silent=True) or {}
+    command = data.get("command", "").strip()
+    if not command:
+        return jsonify({"error": "ADB command is required."}), 400
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    adb_path = shutil_which("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+
+    try:
+        cmd = [adb_path] + shlex.split(command)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid command: {exc}"}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+@app.route("/api/tool/automation", methods=["POST"]) 
+def local_automation():
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    data = request.get_json(silent=True) or {}
+    command = (data.get("command") or "").strip()
+    if not command:
+        return jsonify({"error": "Automation command is required."}), 400
+
+    try:
+        result = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+def shutil_which(name):
+    return subprocess.run(["bash", "-lc", f"command -v {name}"], capture_output=True, text=True, check=False).stdout.strip() or None
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+# Notes:
+# 1. This app supports local chat history in data/chat_history.json.
+# 2. Set DEEPSEEK_API_KEY and optionally DEEPSEEK_API_URL before running.
+# 3. For local automation and ADB commands, set ENABLE_LOCAL_AUTOMATION=true.
+# 4. Use the web UI to trigger chat streaming and tool operations.
