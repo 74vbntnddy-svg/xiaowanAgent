@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+import requests
+
+app = Flask(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+DATA_DIR.mkdir(exist_ok=True)
+
+MODEL_LIST = [
+    {"name": "deepseek-chat", "display": "DeepSeek Chat 通用对话"},
+    {"name": "deepseek-coder", "display": "DeepSeek Coder 代码模式"},
+    {"name": "deepseek-reasoner", "display": "DeepSeek Reasoner 推理模式"},
+]
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are XiaoWan Agent, a helpful local AI assistant. "
+    "Answer clearly and professionally. Use concise explanations, step-by-step guidance, "
+    "and well-formatted code blocks when appropriate."
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_sessions() -> dict:
+    if not SESSIONS_FILE.exists():
+        return {}
+    try:
+        with SESSIONS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_sessions(data: dict):
+    with SESSIONS_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+SESSIONS = load_sessions()
+
+
+def get_session_or_create(session_id: str | None) -> str:
+    if not session_id:
+        session_id = f"session-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    SESSIONS.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "title": "新会话",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "messages": [],
+        },
+    )
+    SESSIONS[session_id]["updated_at"] = utc_now()
+    save_sessions(SESSIONS)
+    return session_id
+
+
+def add_message(session_id: str, role: str, content: str):
+    session = SESSIONS.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "title": "新会话",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "messages": [],
+        },
+    )
+    session["messages"].append({
+        "role": role,
+        "content": content,
+        "timestamp": utc_now(),
+    })
+    if role == "user" and not session.get("title") or session.get("title") == "新会话":
+        title = (content or "未命名会话").strip()
+        session["title"] = title[:32] or "新会话"
+    session["updated_at"] = utc_now()
+    save_sessions(SESSIONS)
+
+
+def build_messages(session_id: str | None, prompt: str):
+    session_id = get_session_or_create(session_id)
+    session = SESSIONS.get(session_id, {})
+    messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+    for item in session.get("messages", []):
+        role = item.get("role")
+        if role in {"user", "assistant"}:
+            messages.append({"role": role, "content": item.get("content", "")})
+    messages.append({"role": "user", "content": prompt})
+    return session_id, messages
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", models=MODEL_LIST)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "sessions": len(SESSIONS), "models": len(MODEL_LIST)})
+
+
+@app.route("/api/sessions", methods=["GET"])
+def api_sessions():
+    items = []
+    for session_id, session in sorted(SESSIONS.items(), key=lambda kv: kv[1].get("updated_at", ""), reverse=True):
+        messages = session.get("messages", [])
+        preview = next((msg.get("content", "").strip() for msg in reversed(messages) if msg.get("role") == "user"), "")
+        items.append({
+            "id": session_id,
+            "title": session.get("title", "新会话"),
+            "updated_at": session.get("updated_at", utc_now()),
+            "preview": preview[:120],
+        })
+    return jsonify(items)
+
+
+@app.route("/api/session/<session_id>", methods=["GET"])
+def api_session(session_id):
+    session = SESSIONS.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session)
+
+
+@app.route("/api/session/<session_id>", methods=["DELETE"])
+def delete_session(session_id):
+    if session_id in SESSIONS:
+        del SESSIONS[session_id]
+        save_sessions(SESSIONS)
+        return jsonify({"ok": True})
+    return jsonify({"error": "Session not found"}), 404
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_api():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return jsonify({"error": "DeepSeek API Key is required."}), 400
+    if not prompt:
+        return jsonify({"error": "Prompt cannot be empty."}), 400
+
+    allowed_models = {item["name"] for item in MODEL_LIST}
+    if model_name not in allowed_models:
+        return jsonify({"error": f"Unsupported model: {model_name}"}), 400
+
+    session_id, messages = build_messages(session_id, prompt)
+    add_message(session_id, "user", prompt)
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.7,
+        "stream": False,
+    }
+
+    try:
+        res = requests.post(
+            os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        result = res.json()
+        if res.status_code >= 400:
+            message = result.get("error", {}).get("message") or result.get("message") or "API request failed"
+            return jsonify({"error": message}), res.status_code
+
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        add_message(session_id, "assistant", answer)
+        return jsonify({"session_id": session_id, "content": answer, "raw": result})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Network error: {exc}"}), 500
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return Response("event: error\ndata: {\"error\": \"DeepSeek API Key is required.\"}\n\n", mimetype="text/event-stream")
+    if not prompt:
+        return Response("event: error\ndata: {\"error\": \"Prompt cannot be empty.\"}\n\n", mimetype="text/event-stream")
+
+    session_id, messages = build_messages(session_id, prompt)
+    add_message(session_id, "user", prompt)
+
+    def generate():
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True,
+        }
+
+        try:
+            res = requests.post(
+                os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+                headers=headers,
+                json=body,
+                timeout=60,
+                stream=True,
+            )
+            if res.status_code >= 400:
+                error_data = res.json() if res.content else {}
+                msg = error_data.get("error", {}).get("message") or error_data.get("message") or "API request failed"
+                yield f"event: error\ndata: {json.dumps({'error': msg})}\n\n"
+                return
+
+            collected = []
+            for raw_line in res.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data: "):
+                    continue
+                data = raw_line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = evt.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content") or ""
+                if not content:
+                    continue
+                collected.append(content)
+                yield f"event: chunk\ndata: {json.dumps({'content': content})}\n\n"
+
+            full_text = "".join(collected).strip()
+            if full_text:
+                add_message(session_id, "assistant", full_text)
+            yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'content': full_text})}\n\n"
+        except requests.RequestException as exc:
+            yield f"event: error\ndata: {json.dumps({'error': f'Network error: {exc}'})}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+def which_command(name: str) -> str | None:
+    try:
+        return subprocess.run(["bash", "-lc", f"command -v {name}"], capture_output=True, text=True, check=False).stdout.strip() or None
+    except Exception:
+        return None
+
+
+@app.route("/api/tool/adb/devices", methods=["GET"])
+def adb_devices():
+    adb_path = which_command("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+    result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=20)
+    return jsonify({
+        "ok": result.returncode == 0,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "code": result.returncode,
+    })
+
+
+@app.route("/api/tool/adb/command", methods=["POST"])
+def adb_command():
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    command = (payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"error": "ADB command is required."}), 400
+
+    adb_path = which_command("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+
+    try:
+        cmd = [adb_path] + shlex.split(command)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid command: {exc}"}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "ADB command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+@app.route("/api/tool/local/command", methods=["POST"])
+def local_command():
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    command = (payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"error": "Command is required."}), 400
+
+    try:
+        result = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
