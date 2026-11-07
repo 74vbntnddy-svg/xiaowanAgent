@@ -1,113 +1,453 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>小万 - XiaoWan Agent</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: system-ui, sans-serif;
-        }
-        body {
-            background: #121218;
-            color: #fff;
-            padding: 24px;
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        .header {
-            margin-bottom:20px;
-        }
-        .config-row {
-            display:flex;
-            gap:12px;
-            margin-bottom:16px;
-            flex-wrap:wrap;
-        }
-        select,input {
-            padding:10px 12px;
-            border-radius:8px;
-            border:1px solid #333;
-            background:#1e1e28;
-            color:#fff;
-            outline:none;
-        }
-        textarea {
-            width:100%;
-            min-height:120px;
-            padding:14px;
-            background:#1e1e28;
-            border:1px solid #333;
-            color:#fff;
-            border-radius:10px;
-            resize:vertical;
-            margin-bottom:12px;
-        }
-        button {
-            padding:11px 22px;
-            border:none;
-            border-radius:8px;
-            background:#4060ff;
-            color:white;
-            font-weight:bold;
-            cursor:pointer;
-        }
-        #result {
-            margin-top:20px;
-            white-space:pre-wrap;
-            padding:16px;
-            background:#1a1a24;
-            border-radius:10px;
-            min-height:80px;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>小万 XiaoWan Agent</h1>
-        <p>DeepSeek API | 模型切换 + 代码创作模式</p>
-    </div>
+from __future__ import annotations
 
-    <div class="config-row">
-        <select id="modelSelect">
-            {% for m in models %}
-            <option value="{{m.name}}">{{m.display}}</option>
-            {% endfor %}
-        </select>
-        <input type="text" id="apiKey" placeholder="粘贴DeepSeek API Key">
-    </div>
+import json
+import os
+import shlex
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 
-    <textarea id="promptInput" placeholder="在这里输入你的问题，写代码、创作任务都可以..."></textarea>
-    <button onclick="sendChat()">发送请求</button>
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
+import requests
 
-    <div id="result"></div>
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "xiaowan-enterprise-secret-key")
 
-    <script>
-        async function sendChat(){
-            const apiKey = document.getElementById("apiKey").value;
-            const model = document.getElementById("modelSelect").value;
-            const prompt = document.getElementById("promptInput").value;
-            const resBox = document.getElementById("result");
-            resBox.innerText = "正在请求...";
-            try{
-                const resp = await fetch("/api/chat",{
-                    method:"POST",
-                    headers:{"Content-Type":"application/json"},
-                    body:JSON.stringify({api_key:apiKey, model:model, prompt:prompt})
-                })
-                const data = await resp.json();
-                if(data.choices && data.choices[0]){
-                    resBox.innerText = data.choices[0].message.content;
-                }else{
-                    resBox.innerText = JSON.stringify(data,null,2);
-                }
-            }catch(err){
-                resBox.innerText = "请求出错："+err;
-            }
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+AUDIT_FILE = DATA_DIR / "audit.log"
+DATA_DIR.mkdir(exist_ok=True)
+
+MODEL_LIST = [
+    {"name": "deepseek-chat", "display": "DeepSeek Chat 通用对话"},
+    {"name": "deepseek-coder", "display": "DeepSeek Coder 代码模式"},
+    {"name": "deepseek-reasoner", "display": "DeepSeek Reasoner 推理模式"},
+]
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are XiaoWan Agent Enterprise, a professional AI assistant for business workflows. "
+    "Provide structured, accurate, and actionable answers. Use clear sections, bullet points, and code blocks when useful."
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, type(default)) else default
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def write_json(path: Path, data):
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def log_event(event: str, detail: str = ""):
+    entry = {"timestamp": utc_now(), "event": event, "detail": detail}
+    try:
+        with AUDIT_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def load_sessions() -> dict:
+    data = read_json(SESSIONS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_sessions(data: dict):
+    write_json(SESSIONS_FILE, data)
+
+
+SESSIONS = load_sessions()
+
+
+def configured_auth() -> tuple[str, str] | None:
+    username = (os.getenv("ADMIN_USERNAME") or "").strip()
+    password = (os.getenv("ADMIN_PASSWORD") or "").strip()
+    if username and password:
+        return username, password
+    return None
+
+
+def is_logged_in() -> bool:
+    return bool(session.get("authed"))
+
+
+@app.before_request
+def enforce_auth():
+    if request.path in {"/login", "/logout"}:
+        return None
+    if request.path.startswith("/static/"):
+        return None
+    auth = configured_auth()
+    if not auth:
+        return None
+    if not is_logged_in():
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Authentication required."}), 401
+        return redirect(url_for("login_page"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    auth = configured_auth()
+    if not auth:
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = (request.form.get("password") or "").strip()
+        if username == auth[0] and password == auth[1]:
+            session["authed"] = True
+            session["username"] = username
+            log_event("login", username)
+            return redirect(url_for("index"))
+        return render_template("login.html", error="用户名或密码不正确")
+
+    if is_logged_in():
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
+
+def get_session_or_create(session_id: str | None) -> str:
+    if not session_id:
+        session_id = f"session-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    SESSIONS.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "title": "新会话",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "messages": [],
+        },
+    )
+    SESSIONS[session_id]["updated_at"] = utc_now()
+    save_sessions(SESSIONS)
+    return session_id
+
+
+def add_message(session_id: str, role: str, content: str):
+    session_data = SESSIONS.setdefault(
+        session_id,
+        {
+            "id": session_id,
+            "title": "新会话",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "messages": [],
+        },
+    )
+    session_data["messages"].append({
+        "role": role,
+        "content": content,
+        "timestamp": utc_now(),
+    })
+    if role == "user" and (not session_data.get("title") or session_data.get("title") == "新会话"):
+        title = (content or "未命名会话").strip()
+        session_data["title"] = title[:32] or "新会话"
+    session_data["updated_at"] = utc_now()
+    save_sessions(SESSIONS)
+
+
+def build_messages(session_id: str | None, prompt: str):
+    session_id = get_session_or_create(session_id)
+    session_data = SESSIONS.get(session_id, {})
+    messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+    for item in session_data.get("messages", []):
+        role = item.get("role")
+        if role in {"user", "assistant"}:
+            messages.append({"role": role, "content": item.get("content", "")})
+    messages.append({"role": "user", "content": prompt})
+    return session_id, messages
+
+
+def dashboard_summary():
+    total_sessions = len(SESSIONS)
+    total_messages = sum(len(session_data.get("messages", [])) for session_data in SESSIONS.values())
+    active_today = 0
+    now = datetime.now(timezone.utc)
+    for session_data in SESSIONS.values():
+        updated_at = session_data.get("updated_at")
+        if not updated_at:
+            continue
+        try:
+            dt = datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if (now - dt).total_seconds() <= 86400:
+                active_today += 1
+        except ValueError:
+            pass
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": total_messages,
+        "active_today": active_today,
+        "auth_enabled": bool(configured_auth()),
+        "model_count": len(MODEL_LIST),
+    }
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", models=MODEL_LIST)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", **dashboard_summary()})
+
+
+@app.route("/api/dashboard")
+def api_dashboard():
+    return jsonify(dashboard_summary())
+
+
+@app.route("/api/sessions")
+def api_sessions():
+    items = []
+    for session_id, session_data in sorted(SESSIONS.items(), key=lambda kv: kv[1].get("updated_at", ""), reverse=True):
+        messages = session_data.get("messages", [])
+        preview = next((msg.get("content", "").strip() for msg in reversed(messages) if msg.get("role") == "user"), "")
+        items.append({
+            "id": session_id,
+            "title": session_data.get("title", "新会话"),
+            "updated_at": session_data.get("updated_at", utc_now()),
+            "preview": preview[:140],
+            "message_count": len(messages),
+        })
+    return jsonify(items)
+
+
+@app.route("/api/session/<session_id>")
+def api_session(session_id):
+    session_data = SESSIONS.get(session_id)
+    if not session_data:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session_data)
+
+
+@app.route("/api/session/<session_id>/export", methods=["POST"]) 
+def export_session(session_id):
+    session_data = SESSIONS.get(session_id)
+    if not session_data:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({
+        "session_id": session_id,
+        "export": session_data,
+        "download_name": f"session-{session_id}.json",
+    })
+
+
+@app.route("/api/session/<session_id>", methods=["DELETE"]) 
+def delete_session(session_id):
+    if session_id in SESSIONS:
+        del SESSIONS[session_id]
+        save_sessions(SESSIONS)
+        log_event("session_deleted", session_id)
+        return jsonify({"ok": True})
+    return jsonify({"error": "Session not found"}), 404
+
+
+@app.route("/api/chat", methods=["POST"]) 
+def chat_api():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return jsonify({"error": "DeepSeek API Key is required."}), 400
+    if not prompt:
+        return jsonify({"error": "Prompt cannot be empty."}), 400
+
+    allowed_models = {item["name"] for item in MODEL_LIST}
+    if model_name not in allowed_models:
+        return jsonify({"error": f"Unsupported model: {model_name}"}), 400
+
+    session_id, messages = build_messages(session_id, prompt)
+    add_message(session_id, "user", prompt)
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.7,
+        "stream": False,
+    }
+
+    try:
+        resp = requests.post(
+            os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        result = resp.json()
+        if resp.status_code >= 400:
+            message = result.get("error", {}).get("message") or result.get("message") or "API request failed"
+            return jsonify({"error": message}), resp.status_code
+
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        add_message(session_id, "assistant", answer)
+        log_event("chat_completed", session_id)
+        return jsonify({"session_id": session_id, "content": answer, "raw": result})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Network error: {exc}"}), 500
+
+
+@app.route("/api/chat/stream", methods=["POST"]) 
+def chat_stream():
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    model_name = (payload.get("model") or "deepseek-chat").strip()
+    prompt = (payload.get("prompt") or "").strip()
+    session_id = payload.get("session_id")
+
+    if not api_key:
+        return Response("event: error\ndata: {\"error\": \"DeepSeek API Key is required.\"}\n\n", mimetype="text/event-stream")
+    if not prompt:
+        return Response("event: error\ndata: {\"error\": \"Prompt cannot be empty.\"}\n\n", mimetype="text/event-stream")
+
+    session_id, messages = build_messages(session_id, prompt)
+    add_message(session_id, "user", prompt)
+
+    def generate():
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         }
-    </script>
-</body>
-</html>
+        body = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True,
+        }
+        try:
+            resp = requests.post(
+                os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"),
+                headers=headers,
+                json=body,
+                timeout=60,
+                stream=True,
+            )
+            if resp.status_code >= 400:
+                error_data = resp.json() if resp.content else {}
+                msg = error_data.get("error", {}).get("message") or error_data.get("message") or "API request failed"
+                yield f"event: error\ndata: {json.dumps({'error': msg})}\n\n"
+                return
+
+            collected = []
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data: "):
+                    continue
+                data = raw_line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = evt.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content") or ""
+                if not content:
+                    continue
+                collected.append(content)
+                yield f"event: chunk\ndata: {json.dumps({'content': content})}\n\n"
+
+            full_text = "".join(collected).strip()
+            if full_text:
+                add_message(session_id, "assistant", full_text)
+                log_event("stream_chat_completed", session_id)
+            yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'content': full_text})}\n\n"
+        except requests.RequestException as exc:
+            yield f"event: error\ndata: {json.dumps({'error': f'Network error: {exc}'})}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+def which_command(name: str) -> str | None:
+    try:
+        result = subprocess.run(["bash", "-lc", f"command -v {name}"], capture_output=True, text=True, check=False)
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
+@app.route("/api/tool/adb/devices", methods=["GET"]) 
+def adb_devices():
+    adb_path = which_command("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+    result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=20)
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+@app.route("/api/tool/adb/command", methods=["POST"]) 
+def adb_command():
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    command = (payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"error": "ADB command is required."}), 400
+
+    adb_path = which_command("adb")
+    if not adb_path:
+        return jsonify({"error": "ADB is not installed or not in PATH."}), 400
+
+    try:
+        result = subprocess.run([adb_path] + shlex.split(command), capture_output=True, text=True, timeout=30)
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid command: {exc}"}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "ADB command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+@app.route("/api/tool/local/command", methods=["POST"]) 
+def local_command():
+    if os.getenv("ENABLE_LOCAL_AUTOMATION", "false").lower() not in {"1", "true", "yes"}:
+        return jsonify({"error": "Local automation is disabled. Set ENABLE_LOCAL_AUTOMATION=true."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    command = (payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"error": "Command is required."}), 400
+
+    try:
+        result = subprocess.run(["bash", "-lc", command], capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out."}), 408
+    return jsonify({"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "code": result.returncode})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+""""""""""""","path":"templates/index.html

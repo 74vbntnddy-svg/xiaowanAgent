@@ -1,85 +1,135 @@
-# XiaoWan Agent Pro
+# XiaoWan Agent Enterprise
 
-XiaoWan Agent Pro is a polished local web AI assistant powered by the DeepSeek API. It includes session-based chat memory, streaming responses, markdown rendering, advanced tool integration, and optional local automation / ADB support.
+XiaoWan Agent Enterprise is a business-ready AI assistant built on top of the DeepSeek API. It includes:
+
+- multi-model AI chat
+- session-based conversation memory
+- streaming responses in the browser
+- markdown-formatted outputs
+- export session data
+- workbench-style dashboard
+- optional ADB and local automation tooling
+- optional authentication via environment variables
+- Docker and one-click startup support
 
 ## Features
-- Multi-model DeepSeek support
-- Session history with selectable conversations
-- Streaming chat output in the browser
-- Markdown rendering with code blocks and inline code
-- Local automation command execution (opt-in)
-- Android ADB device checking and command execution
-- Cleaner, more production-like UI
+
+- DeepSeek Chat / Coder / Reasoner models
+- enterprise dashboard with usage summaries
+- conversation deletion and export
+- secure UI login when `ADMIN_USERNAME` and `ADMIN_PASSWORD` are configured
+- ADB device inspection and local command execution via env flag
+- one-command launch via `launch.sh`
+- Docker Compose deployment example
 
 ## Quick Start
 
-1. Create a virtual environment and activate it.
+1. Clone the repo and open the project folder.
+2. Create a virtual environment:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 ```
 
-2. Install dependencies.
+3. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Configure environment variables.
+4. Configure environment variables in your shell or `.env` file:
 
 ```bash
 export DEEPSEEK_API_KEY="your_api_key_here"
 export DEEPSEEK_API_URL="https://api.deepseek.com/v1/chat/completions"
 export ENABLE_LOCAL_AUTOMATION="true"
+export ADMIN_USERNAME="admin"
+export ADMIN_PASSWORD="your-password"
+export SECRET_KEY="your-random-secret"
 ```
 
-4. Run the app.
+5. Launch the app:
 
 ```bash
 python app.py
 ```
 
-5. Open the browser.
+6. Open the dashboard:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-## Project Structure
+## Optional Enterprise Security
 
-```text
-.
-├── app.py
-├── README.md
-├── requirements.txt
-├── data/
-│   └── sessions.json
-├── templates/
-│   └── index.html
-└── .env.example
-```
-
-## Environment Variables
+Set the following environment variables to enable login:
 
 ```bash
-DEEPSEEK_API_KEY=your_api_key_here
-DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
-ENABLE_LOCAL_AUTOMATION=false
+export ADMIN_USERNAME="admin"
+export ADMIN_PASSWORD="strong-password"
+export SECRET_KEY="your-random-secret"
 ```
 
-## Security Notes
+If both `ADMIN_USERNAME` and `ADMIN_PASSWORD` are empty, the app runs in open mode.
 
-- Local automation and ADB are disabled by default.
-- Turn on `ENABLE_LOCAL_AUTOMATION=true` only when you explicitly want local command execution.
-- Keep the API key in a secure location or environment variable, not in source-controlled files.
+## Local Automation and ADB
 
-## Upgrade Notes
+To enable local command execution and ADB functions, set:
 
-This advanced version adds:
-- conversation history and session deletion
-- streaming chat responses
-- markdown formatting in the result view
-- tool panel for local automation and ADB
-- a more polished and product-like UI
+```bash
+export ENABLE_LOCAL_AUTOMATION="true"
+```
+
+This enables:
+
+- `/api/tool/local/command`
+- `/api/tool/adb/devices`
+- `/api/tool/adb/command`
+
+## Docker Compose
+
+You can run the app with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Example `docker-compose.yml`:
+
+```yaml
+services:
+  xiaowan-agent:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-https://api.deepseek.com/v1/chat/completions}
+      ENABLE_LOCAL_AUTOMATION: ${ENABLE_LOCAL_AUTOMATION:-false}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SECRET_KEY: ${SECRET_KEY:-xiaowan-enterprise-secret-key}
+```
+
+## One-click Launch
+
+```bash
+chmod +x launch.sh
+./launch.sh
+```
+
+## Files
+
+- `app.py` — Flask server and API endpoints
+- `templates/index.html` — enterprise UI
+- `templates/login.html` — login page
+- `requirements.txt` — Python dependencies
+- `docker-compose.yml` — deployment example
+- `launch.sh` — one-click local launcher
+- `.env.example` — example environment configuration
+
+## Notes
+
+This version is designed for business use and local deployment, with a stronger UI, protected access, and more operational capabilities than the basic chat prototype.
 
